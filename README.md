@@ -30,14 +30,14 @@ Or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Rivium-co/rivium-ab-testing-ios-sdk.git", from: "0.1.0")
+    .package(url: "https://github.com/Rivium-co/rivium-ab-testing-ios-sdk.git", from: "0.2.0")
 ]
 ```
 
 ### CocoaPods
 
 ```ruby
-pod 'RiviumAbTestingSDK', '~> 0.1.0'
+pod 'RiviumAbTestingSDK', '~> 0.2.0'
 ```
 
 Then run `pod install`.
