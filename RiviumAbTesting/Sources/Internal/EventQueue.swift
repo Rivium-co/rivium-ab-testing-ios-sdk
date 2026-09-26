@@ -4,6 +4,8 @@ internal class EventQueue {
     private let apiClient: ApiClient
     private let flushInterval: TimeInterval
     private let maxQueueSize: Int
+    /// The signed-in user; with a user token only their events may be sent.
+    private let currentUserId: () -> String?
 
     private var events: [TrackEvent] = []
     private var flushTimer: Timer?
@@ -12,10 +14,16 @@ internal class EventQueue {
 
     private static let persistenceFileName = "rivium_ab_testing_pending_events.json"
 
-    init(apiClient: ApiClient, flushInterval: TimeInterval, maxQueueSize: Int) {
+    init(
+        apiClient: ApiClient,
+        flushInterval: TimeInterval,
+        maxQueueSize: Int,
+        currentUserId: @escaping () -> String? = { nil }
+    ) {
         self.apiClient = apiClient
         self.flushInterval = flushInterval
         self.maxQueueSize = maxQueueSize
+        self.currentUserId = currentUserId
     }
 
     func start() {
@@ -57,8 +65,16 @@ internal class EventQueue {
 
     func flush() {
         lock.lock()
+        // With a user token the service credits every event in the batch to
+        // the token's user, so another user's leftover events can't be sent
+        // under it: they would be credited to the wrong person.
+        if apiClient.usesUserToken {
+            let userId = currentUserId()
+            events.removeAll { $0.userId != userId }
+        }
         guard !events.isEmpty else {
             lock.unlock()
+            clearPersistedEvents()
             return
         }
         let toFlush = events
@@ -69,14 +85,49 @@ internal class EventQueue {
         clearPersistedEvents()
 
         apiClient.trackEvents(toFlush) { [weak self] result in
-            if case .failure = result {
-                // Re-add events if flush failed and persist them
-                self?.lock.lock()
-                self?.events.insert(contentsOf: toFlush, at: 0)
-                self?.lock.unlock()
-                self?.persistEvents()
+            self?.handle(result, sent: toFlush, requeue: true)
+        }
+    }
+
+    /// Takes one user's pending events out of the queue, before another user
+    /// signs in, so they can be sent under that user's own token.
+    func detach(userId: String) -> [TrackEvent] {
+        lock.lock()
+        let theirs = events.filter { $0.userId == userId }
+        events.removeAll { $0.userId == userId }
+        lock.unlock()
+        persistEvents()
+        return theirs
+    }
+
+    /// Sends events taken with `detach` under `token`. Whatever fails is
+    /// dropped: after the switch there is no token left to send it under.
+    func sendDetached(_ theirs: [TrackEvent], token: String?) {
+        guard !theirs.isEmpty else { return }
+        if apiClient.usesUserToken {
+            guard let token = token else { return }
+            apiClient.trackEvents(theirs, explicitToken: .some(token)) { [weak self] result in
+                self?.handle(result, sent: theirs, requeue: false)
+            }
+        } else {
+            apiClient.trackEvents(theirs) { [weak self] result in
+                self?.handle(result, sent: theirs, requeue: true)
             }
         }
+    }
+
+    private func handle(_ result: Result<Void, RiviumAbTestingError>, sent: [TrackEvent], requeue: Bool) {
+        guard case .failure(let error) = result, requeue else { return }
+        // Retry only what can succeed later: no network, rate limited, a
+        // server error, or no valid token yet (401). Any other 4xx (a bad
+        // request, the monthly event limit) would fail again forever.
+        if case .apiError(let code, _) = error, code != 401, code != 429, code > 0, code < 500 {
+            return
+        }
+        lock.lock()
+        events.insert(contentsOf: sent, at: 0)
+        lock.unlock()
+        persistEvents()
     }
 
     // MARK: - Persistence

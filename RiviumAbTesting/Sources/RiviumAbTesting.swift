@@ -50,10 +50,12 @@ public final class RiviumAbTesting {
         self.config = config
         self.storage = Storage()
         self.apiClient = ApiClient(config: config)
+        let storage = self.storage
         self.eventQueue = EventQueue(
             apiClient: apiClient!,
             flushInterval: config.flushInterval,
-            maxQueueSize: config.maxQueueSize
+            maxQueueSize: config.maxQueueSize,
+            currentUserId: { storage?.userId }
         )
         self.targetingEngine = TargetingEngine()
 
@@ -91,8 +93,19 @@ public final class RiviumAbTesting {
     // MARK: - User Management
 
     /// Set user ID for experiment assignment
+    ///
+    /// Call it again on login and logout. When the user changes, the last
+    /// user's pending events are sent under their own token, then their token
+    /// is dropped.
     public func setUserId(_ userId: String) {
         ensureInitialized()
+        if let previous = storage?.userId, previous != userId {
+            let oldToken = apiClient?.peekToken()
+            apiClient?.clearToken()
+            if let theirs = eventQueue?.detach(userId: previous) {
+                eventQueue?.sendDetached(theirs, token: oldToken)
+            }
+        }
         storage?.userId = userId
         storage?.clearAssignments() // Clear cached assignments when user changes
     }
@@ -527,6 +540,7 @@ public final class RiviumAbTesting {
 
     /// Reset SDK state (for testing)
     public func reset() {
+        apiClient?.clearToken()
         storage?.clear()
         experimentLock.lock()
         experiments = []

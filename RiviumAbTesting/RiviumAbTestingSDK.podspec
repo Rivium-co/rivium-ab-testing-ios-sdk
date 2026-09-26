@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'RiviumAbTestingSDK'
-  s.version          = '0.1.0'
+  s.version          = '0.2.0'
   s.summary          = 'A/B Testing and Feature Flags SDK for iOS with offline-first sync.'
   s.description      = <<-DESC
 RiviumAbTesting is a powerful A/B testing and feature flags SDK for iOS.

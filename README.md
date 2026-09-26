@@ -50,7 +50,10 @@ import RiviumAbTesting
 // 1. Initialize the SDK
 let config = RiviumAbTestingConfig(
     apiKey: "rv_live_your_api_key",
-    debug: true
+    // Your server mints this for the signed-in user (see "User tokens").
+    tokenProvider: { completion in
+        MyBackend.fetchRiviumToken { result in completion(result) }
+    }
 )
 RiviumAbTesting.shared.initialize(config: config)
 
@@ -72,6 +75,26 @@ RiviumAbTesting.shared.trackConversion(experimentKey: "checkout-redesign", value
 // 5. Flush pending events
 RiviumAbTesting.shared.flush()
 ```
+
+## User tokens
+
+The API key ships inside your app, so anyone can read it. On its own it can't
+prove which user a request is for. Your server can: it holds your project's
+**server secret** and mints a short-lived token for the signed-in user
+(`POST https://auth.rivium.co/users/token`, or `createUserToken()` in the
+Node.js SDK). The SDK sends it with every request, and the service takes the
+user from the token instead of from the app.
+
+`tokenProvider` is called when a token is needed, again shortly before it
+expires, and once more if the service reports it expired; requests made at the
+same time share one call. Calling `setUserId` with a different user sends the
+last user's pending events under their own token, then drops their token.
+
+A token is **required**: assigning variants, tracking events and
+evaluating flags are refused without one (reading the experiment and flag
+lists is not, so the app can load them before anyone signs in). The same token works for Rivium Chat and Sync.
+
+**Never put the server secret in the app.**
 
 ## A/B Testing
 
@@ -214,7 +237,7 @@ Listen for SDK events:
 class AppDelegate: UIResponder, UIApplicationDelegate, RiviumAbTestingDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions ...) -> Bool {
-        let config = RiviumAbTestingConfig(apiKey: "rv_live_your_api_key", debug: true)
+        let config = RiviumAbTestingConfig(apiKey: "rv_live_your_api_key", tokenProvider: fetchRiviumToken)
         RiviumAbTesting.shared.initialize(config: config, delegate: self)
         return true
     }
@@ -246,7 +269,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, RiviumAbTestingDelegate {
 ```swift
 let config = RiviumAbTestingConfig(
     apiKey: "rv_live_your_api_key",
-    debug: true,                // Enable debug logging
+    tokenProvider: fetchRiviumToken, // user token minted by your server
+    debug: false,               // debug logging (development only)
     flushInterval: 10.0,        // Auto-flush interval in seconds (default: 30)
     maxQueueSize: 50            // Max events before auto-flush (default: 100)
 )

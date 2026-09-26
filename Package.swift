@@ -18,6 +18,11 @@ let package = Package(
             name: "RiviumAbTesting",
             dependencies: [],
             path: "RiviumAbTesting/Sources"
+        ),
+        .testTarget(
+            name: "RiviumAbTestingTests",
+            dependencies: ["RiviumAbTesting"],
+            path: "RiviumAbTesting/Tests"
         )
     ],
     swiftLanguageVersions: [.v5]
