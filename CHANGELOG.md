@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Feature flag rollout is now stable across app launches and matches Android for the same user.
+
 ## 0.2.0
 
 - Signed user tokens: new `tokenProvider` option. Your server mints a Rivium user token and the SDK sends it with every request. Required for assigning variants, tracking and flag evaluation.

@@ -411,7 +411,7 @@ public final class RiviumAbTesting {
 
         if flag.rolloutPercentage < 100 {
             let combined = userId + flagKey
-            let hash = abs(combined.hashValue) % 100
+            let hash = RolloutHash.bucket(combined)
             if hash >= flag.rolloutPercentage {
                 return false
             }

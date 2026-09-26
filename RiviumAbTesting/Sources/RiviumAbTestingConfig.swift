@@ -42,7 +42,7 @@ public struct RiviumAbTestingConfig {
     internal static let apiUrl = "https://abtest.rivium.co"
 
     /// SDK version (updated by publish script)
-    internal static let sdkVersion = "0.2.0"
+    internal static let sdkVersion = "0.2.1"
 
     public init(
         apiKey: String,
