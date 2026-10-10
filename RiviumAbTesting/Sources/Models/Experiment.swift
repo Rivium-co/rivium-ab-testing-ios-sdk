@@ -93,6 +93,9 @@ public struct Assignment: Codable {
     public let variantKey: String
     public let isControl: Bool
     public let config: [String: AnyCodable]?
+    /// False when the user is shown this (control) variant without taking
+    /// part in the experiment; nil when the service did not say.
+    public let inExperiment: Bool?
 
     public init(
         experimentId: String,
@@ -100,7 +103,8 @@ public struct Assignment: Codable {
         variantId: String,
         variantKey: String,
         isControl: Bool,
-        config: [String: AnyCodable]? = nil
+        config: [String: AnyCodable]? = nil,
+        inExperiment: Bool? = nil
     ) {
         self.experimentId = experimentId
         self.experimentKey = experimentKey
@@ -108,6 +112,7 @@ public struct Assignment: Codable {
         self.variantKey = variantKey
         self.isControl = isControl
         self.config = config
+        self.inExperiment = inExperiment
     }
 }
 

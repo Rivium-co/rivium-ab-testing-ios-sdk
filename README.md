@@ -30,14 +30,14 @@ Or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Rivium-co/rivium-ab-testing-ios-sdk.git", from: "0.2.0")
+    .package(url: "https://github.com/Rivium-co/rivium-ab-testing-ios-sdk.git", from: "0.2.2")
 ]
 ```
 
 ### CocoaPods
 
 ```ruby
-pod 'RiviumAbTestingSDK', '~> 0.2.0'
+pod 'RiviumAbTestingSDK', '~> 0.2.2'
 ```
 
 Then run `pod install`.
@@ -51,6 +51,7 @@ import RiviumAbTesting
 let config = RiviumAbTestingConfig(
     apiKey: "rv_live_your_api_key",
     // Your server mints this for the signed-in user (see "User tokens").
+    // Complete with .failure while no one is signed in.
     tokenProvider: { completion in
         MyBackend.fetchRiviumToken { result in completion(result) }
     }
@@ -87,8 +88,13 @@ user from the token instead of from the app.
 
 `tokenProvider` is called when a token is needed, again shortly before it
 expires, and once more if the service reports it expired; requests made at the
-same time share one call. Calling `setUserId` with a different user sends the
-last user's pending events under their own token, then drops their token.
+same time share one call. Complete with `.failure` while no one is signed in.
+A provider that never calls `completion` counts as having no token after 15
+seconds.
+
+If you would rather hand tokens over yourself, leave `tokenProvider` out and
+call `RiviumAbTesting.shared.setUserToken(token)` after sign-in and whenever
+you refresh the token.
 
 A token is **required**: assigning variants, tracking events and
 evaluating flags are refused without one (reading the experiment and flag
@@ -96,18 +102,47 @@ lists is not, so the app can load them before anyone signs in). The same token w
 
 **Never put the server secret in the app.**
 
+### Before your user signs in
+
+You can call `initialize` before anyone is signed in. Without a token the SDK
+waits instead of failing: `RiviumAbTesting.shared.isAwaitingUserToken` is
+`true`, `onAwaitingUserToken` is called once, `getVariant` returns the default
+you pass and nothing is sent for a user. It carries on by itself as soon as
+there is a token: the variants your app asked for are fetched (the delegate's
+`didAssignVariant` is called for each) and the kept events are sent.
+
+```swift
+RiviumAbTesting.shared.onAwaitingUserToken = { /* e.g. show the default experience */ }
+
+// After sign-in
+RiviumAbTesting.shared.refreshUserToken()      // with a tokenProvider: asks it again now
+RiviumAbTesting.shared.setUserToken(token)     // without one: hand the token over
+
+// After sign-out
+RiviumAbTesting.shared.clearUserId()           // or setUserToken(nil)
+```
+
+Events recorded before sign-in belong to an anonymous user, and the service
+credits events to the user in the token. So after sign-in only the events
+recorded for that same user id are sent (call `setUserId` with the id your
+server puts in the token before you track); the rest are dropped. The queue
+holds at most 1,000 events and drops the oldest first.
+
+### Switching users
+
+A different user id (`setUserId`), a token for another user or a sign-out
+(`clearUserId()`, `setUserToken(nil)`) clears the previous user's variants,
+attributes, token and pending events before anything is done for the next
+user. Events of the previous user that are ready are sent once more under
+their own token; they are never sent under another user's token. Set the user
+attributes again after a switch.
+
 ## A/B Testing
 
 ### Get Variant
 
 ```swift
-// Synchronous
-let variant = RiviumAbTesting.shared.getVariant(
-    experimentKey: "experiment-key",
-    defaultVariant: "control"  // fallback if offline and no cache
-)
-
-// Asynchronous (recommended)
+// Asynchronous (recommended): waits for the service's answer
 RiviumAbTesting.shared.getVariant(experimentKey: "experiment-key") { variant in
     switch variant {
     case "variant-a":
@@ -116,7 +151,23 @@ RiviumAbTesting.shared.getVariant(experimentKey: "experiment-key") { variant in
         showOriginalCheckout()
     }
 }
+
+// Synchronous: never blocks, safe on the main thread
+let variant = RiviumAbTesting.shared.getVariant(
+    experimentKey: "experiment-key",
+    defaultVariant: "control"  // returned until the service has answered
+)
 ```
+
+The synchronous `getVariant` returns the variant the service assigned earlier
+(it is kept on the device). The first time an experiment is asked for it
+returns `defaultVariant` at once and fetches the assignment in the background;
+the delegate's `didAssignVariant` tells you when it is there. Use the
+completion form when the first answer matters. The variant always comes from
+the service: the SDK never picks one on the device.
+
+A user the service keeps out of an experiment (targeting, traffic) gets the
+control variant; events you track for that experiment are then not recorded.
 
 ### Get Variant Config
 
@@ -264,13 +315,25 @@ class AppDelegate: UIResponder, UIApplicationDelegate, RiviumAbTestingDelegate {
 }
 ```
 
+No SDK method stops the app when it is called before `initialize`, before the
+first load has finished or before a user is signed in: getters return the
+default you pass and `track…` does nothing. If the first load fails (no
+network) the SDK works from its cache and loads again when the network is back.
+
+## Offline Support
+
+Events are queued locally (at most 1,000, kept across app launches in
+Application Support) and sent 100 at a time. When the service is unreachable
+or asks the SDK to slow down, the SDK waits before it tries again, and it
+sends what is waiting when the network comes back.
+
 ## Configuration
 
 ```swift
 let config = RiviumAbTestingConfig(
     apiKey: "rv_live_your_api_key",
     tokenProvider: fetchRiviumToken, // user token minted by your server
-    debug: false,               // debug logging (development only)
+    debug: false,               // log to the console (development only; no keys, tokens or bodies)
     flushInterval: 10.0,        // Auto-flush interval in seconds (default: 30)
     maxQueueSize: 50            // Max events before auto-flush (default: 100)
 )
@@ -295,10 +358,15 @@ RiviumAbTesting.shared.flush()
 |---|---|
 | `initialize(config:delegate:)` | Initialize the SDK |
 | `setUserId(_:)` | Set user ID for assignment |
+| `clearUserId()` | Sign-out: forget the user and wait for a token |
+| `setUserToken(_:)` | Hand over a user token (`nil` after sign-out) |
+| `refreshUserToken()` | Ask the `tokenProvider` again now (after sign-in or sign-out) |
+| `isAwaitingUserToken` | `true` while the SDK waits for a user token |
+| `onAwaitingUserToken` | Called once each time the SDK starts waiting |
 | `getUserId()` | Get current user ID |
 | `setUserAttributes(_:)` | Set targeting attributes |
-| `getVariant(experimentKey:)` | Get assigned variant (sync) |
-| `getVariant(experimentKey:completion:)` | Get assigned variant (async) |
+| `getVariant(experimentKey:)` | Get assigned variant (sync, never blocks) |
+| `getVariant(experimentKey:completion:)` | Get assigned variant (waits for the service) |
 | `getVariantConfig(experimentKey:)` | Get variant configuration |
 | `isFeatureEnabled(_:)` | Check if feature flag is on (local) |
 | `isFeatureEnabled(_:completion:)` | Check flag with server eval |

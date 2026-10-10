@@ -10,6 +10,12 @@ import Foundation
 /// Called when a token is needed, again shortly before it expires, and once
 /// more if the service reports it expired. Call `completion` with the token or
 /// an error, on any thread. Never put the server secret in the app.
+///
+/// Call `completion` with `.failure` while no one is signed in. That is not an
+/// error: the SDK waits for a user token (see
+/// `RiviumAbTesting.isAwaitingUserToken`) and asks again after
+/// `RiviumAbTesting.refreshUserToken()`. A provider that never calls
+/// `completion` counts as having no token after 15 seconds.
 public typealias RiviumTokenProvider = (_ completion: @escaping (Result<String, Error>) -> Void) -> Void
 
 /// Configuration for RiviumAbTesting SDK
@@ -17,7 +23,7 @@ public struct RiviumAbTestingConfig {
     /// API key for authentication (format: rv_live_xxx or rv_test_xxx)
     public let apiKey: String
 
-    /// Enable debug logging
+    /// Enable debug logging (development only; keys, tokens and request bodies are not logged)
     public let debug: Bool
 
     /// Interval for flushing events (in seconds)
@@ -42,7 +48,7 @@ public struct RiviumAbTestingConfig {
     internal static let apiUrl = "https://abtest.rivium.co"
 
     /// SDK version (updated by publish script)
-    internal static let sdkVersion = "0.2.1"
+    internal static let sdkVersion = "0.2.2"
 
     public init(
         apiKey: String,

@@ -1,6 +1,37 @@
 import Foundation
 
+/// Why a call to the service gave no result.
+internal struct ApiFailure: Error {
+    /// HTTP status, or nil when there was no answer (no network).
+    let status: Int?
+    /// The service's own error code (`token_required`, `token_expired`, ...).
+    let code: String?
+    let message: String
+    /// How long the service asked us to wait (HTTP 429), in seconds.
+    let retryAfter: TimeInterval?
+
+    init(status: Int?, code: String? = nil, message: String, retryAfter: TimeInterval? = nil) {
+        self.status = status
+        self.code = code
+        self.message = message
+        self.retryAfter = retryAfter
+    }
+
+    /// The error as the app sees it.
+    var publicError: RiviumAbTestingError {
+        if let status = status { return .apiError(status, message) }
+        return .networkError(message)
+    }
+}
+
+/// HTTP calls to the service.
+///
+/// Reads (experiments, flags, config) need only the API key. Calls that act
+/// for a user (assign, events, flag evaluation) take the user token to send.
 internal class ApiClient {
+    /// The most events the service takes in one request.
+    static let maxEventsPerRequest = 100
+
     private let config: RiviumAbTestingConfig
     private let session: URLSession
 
@@ -17,211 +48,96 @@ internal class ApiClient {
         return RiviumAbTestingConfig.apiUrl
     }
 
-    // MARK: - Requests and the user token
+    // MARK: - Requests
 
-    /// Fetch a new token this many seconds before the current one expires.
-    private static let tokenRefreshSkew: TimeInterval = 60
-
-    private let tokenLock = NSLock()
-    private var cachedToken: String?
-    private var cachedTokenExpiresAt: TimeInterval = 0
-    private var tokenWaiters: [(String?) -> Void] = []
-
-    /// True when requests carry a user token (the service then credits them to its user).
-    var usesUserToken: Bool {
-        return config.tokenProvider != nil || config.userToken != nil
-    }
-
-    /// Forget the cached token, e.g. when another user signs in.
-    func clearToken() {
-        tokenLock.lock()
-        cachedToken = nil
-        cachedTokenExpiresAt = 0
-        tokenLock.unlock()
-    }
-
-    /// The token held right now, without fetching a new one.
-    func peekToken() -> String? {
-        if let token = config.userToken { return token }
-        tokenLock.lock()
-        defer { tokenLock.unlock() }
-        return cachedToken
-    }
-
-    /// The current token, fetched through the provider when needed. Concurrent
-    /// callers share one provider call.
-    private func withToken(_ completion: @escaping (String?) -> Void) {
-        if let token = config.userToken { return completion(token) }
-        guard let provider = config.tokenProvider else { return completion(nil) }
-
-        tokenLock.lock()
-        if let token = cachedToken,
-           cachedTokenExpiresAt - Self.tokenRefreshSkew > Date().timeIntervalSince1970 {
-            tokenLock.unlock()
-            return completion(token)
-        }
-        tokenWaiters.append(completion)
-        let first = tokenWaiters.count == 1
-        tokenLock.unlock()
-        guard first else { return }
-
-        provider { [weak self] result in
-            guard let self = self else { return }
-            self.tokenLock.lock()
-            if case .success(let token) = result {
-                self.cachedToken = token
-                self.cachedTokenExpiresAt = Self.tokenExpiry(token)
-            }
-            let token = self.cachedToken
-            let waiters = self.tokenWaiters
-            self.tokenWaiters = []
-            self.tokenLock.unlock()
-            waiters.forEach { $0(token) }
-        }
-    }
-
-    /// Every call to the service goes through here: the API key, the user
-    /// token and one retry with a fresh token when the service says it expired.
-    ///
-    /// `explicitToken` sends a specific token instead (a user who just signed
-    /// out still has events to send under their own token).
+    /// One request: the API key, the user token when given, and the answer
+    /// or why there is none.
     private func perform(
-        _ request: URLRequest,
-        explicitToken: String?? = nil,
-        retry: Bool = true,
-        completion: @escaping (Data?, URLResponse?, Error?) -> Void
+        _ path: String,
+        body: Data? = nil,
+        token: String? = nil,
+        completion: @escaping (Result<Data, ApiFailure>) -> Void
     ) {
-        let original = request
-        let send: (String?) -> Void = { [weak self] token in
-            guard let self = self else { return }
-            var request = original
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(self.config.apiKey, forHTTPHeaderField: "x-api-key")
-            if let token = token {
-                request.setValue(token, forHTTPHeaderField: "x-user-token")
+        guard let url = URL(string: "\(baseUrl)\(path)") else {
+            completion(.failure(ApiFailure(status: nil, message: "Invalid API URL")))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = body == nil ? "GET" : "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(config.apiKey, forHTTPHeaderField: "x-api-key")
+        if let token = token {
+            request.setValue(token, forHTTPHeaderField: "x-user-token")
+        }
+        let route = path.components(separatedBy: "?")[0]
+        Log.debug("→ \(request.httpMethod ?? "") \(route)")
+
+        session.dataTask(with: request) { data, response, error in
+            guard let http = response as? HTTPURLResponse else {
+                Log.debug("← no answer \(route)")
+                completion(.failure(ApiFailure(status: nil, message: error?.localizedDescription ?? "Invalid response")))
+                return
             }
-            self.session.dataTask(with: request) { data, response, error in
-                if retry, explicitToken == nil, self.config.tokenProvider != nil,
-                   (response as? HTTPURLResponse)?.statusCode == 401,
-                   Self.errorCode(data) == "token_expired" {
-                    self.clearToken()
-                    self.perform(original, retry: false, completion: completion)
-                    return
-                }
-                completion(data, response, error)
-            }.resume()
-        }
+            Log.debug("← \(http.statusCode) \(route)")
+            // Any 2xx is a success: the service answers 200 or 201 for the same call.
+            if (200..<300).contains(http.statusCode) {
+                completion(.success(data ?? Data()))
+                return
+            }
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+            let retryAfter = (http.value(forHTTPHeaderField: "Retry-After"))
+                .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+            completion(.failure(ApiFailure(
+                status: http.statusCode,
+                code: json?["code"] as? String,
+                message: (json?["message"] as? String) ?? "Request failed",
+                retryAfter: retryAfter
+            )))
+        }.resume()
+    }
 
-        if let explicit = explicitToken {
-            send(explicit)
-        } else {
-            withToken(send)
+    private func decode<T: Decodable>(_ type: T.Type, _ result: Result<Data, ApiFailure>) -> Result<T, ApiFailure> {
+        switch result {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let data):
+            do {
+                return .success(try JSONDecoder().decode(type, from: data))
+            } catch {
+                return .failure(ApiFailure(status: nil, message: "Failed to decode response: \(error.localizedDescription)"))
+            }
         }
     }
 
-    /// `exp` from the token payload; 0 (fetch again next time) if unreadable.
-    private static func tokenExpiry(_ token: String) -> TimeInterval {
-        let parts = token.split(separator: ".")
-        guard parts.count > 1 else { return 0 }
-        var base64 = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        while base64.count % 4 != 0 { base64 += "=" }
-        guard let data = Data(base64Encoded: base64),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let exp = json["exp"] as? NSNumber else { return 0 }
-        return exp.doubleValue
-    }
-
-    private static func errorCode(_ data: Data?) -> String? {
-        guard let data = data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return json["code"] as? String
+    private func json(_ payload: [String: Any]) -> Data {
+        return (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
     }
 
     // MARK: - Init SDK
 
     /// Initialize SDK and get experiments + config in one call
-    func initSdk(platform: String = "ios", completion: @escaping (Result<InitResponse, RiviumAbTestingError>) -> Void) {
-        guard let url = URL(string: "\(baseUrl)/public/init?platform=\(platform)&sdkVersion=\(RiviumAbTestingConfig.sdkVersion)") else {
-            completion(.failure(.invalidConfig("Invalid API URL")))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-
-        perform(request) { data, response, error in
-            if let error = error {
-                completion(.failure(.networkError(error.localizedDescription)))
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                completion(.failure(.networkError("Invalid response")))
-                return
-            }
-
-            guard httpResponse.statusCode == 200, let data = data else {
-                completion(.failure(.apiError(httpResponse.statusCode, "Request failed")))
-                return
-            }
-
-            do {
-                let initResponse = try JSONDecoder().decode(InitResponse.self, from: data)
-                completion(.success(initResponse))
-            } catch {
-                completion(.failure(.networkError("Failed to decode response: \(error.localizedDescription)")))
-            }
+    func initSdk(platform: String = "ios", completion: @escaping (Result<InitResponse, ApiFailure>) -> Void) {
+        perform("/public/init?platform=\(platform)&sdkVersion=\(RiviumAbTestingConfig.sdkVersion)") { result in
+            completion(self.decode(InitResponse.self, result))
         }
     }
 
     // MARK: - Experiments
 
     /// Fetch all running experiments for the project (uses initSdk internally)
-    func fetchExperiments(completion: @escaping (Result<[Experiment], RiviumAbTestingError>) -> Void) {
+    func fetchExperiments(completion: @escaping (Result<[Experiment], ApiFailure>) -> Void) {
         initSdk { result in
-            switch result {
-            case .success(let initResponse):
-                completion(.success(initResponse.experiments))
-            case .failure(let error):
-                completion(.failure(error))
-            }
+            completion(result.map { $0.experiments })
         }
     }
 
     // MARK: - Feature Flags
 
     /// Fetch all feature flags for the project
-    func fetchFeatureFlags(completion: @escaping (Result<[FeatureFlag], RiviumAbTestingError>) -> Void) {
-        guard let url = URL(string: "\(baseUrl)/public/flags") else {
-            completion(.failure(.invalidConfig("Invalid API URL")))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-
-        perform(request) { data, response, error in
-            if let error = error {
-                completion(.failure(.networkError(error.localizedDescription)))
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                completion(.failure(.networkError("Invalid response")))
-                return
-            }
-
-            guard httpResponse.statusCode == 200, let data = data else {
-                completion(.failure(.apiError(httpResponse.statusCode, "Request failed")))
-                return
-            }
-
-            do {
-                let flagsResponse = try JSONDecoder().decode(FlagsResponse.self, from: data)
-                completion(.success(flagsResponse.flags ?? []))
-            } catch {
-                completion(.failure(.networkError("Failed to decode response: \(error.localizedDescription)")))
-            }
+    func fetchFeatureFlags(completion: @escaping (Result<[FeatureFlag], ApiFailure>) -> Void) {
+        perform("/public/flags") { result in
+            completion(self.decode(FlagsResponse.self, result).map { $0.flags ?? [] })
         }
     }
 
@@ -230,51 +146,16 @@ internal class ApiClient {
         flagKey: String,
         userId: String,
         userAttributes: [String: Any]?,
-        completion: @escaping (Result<FlagEvaluationResult, RiviumAbTestingError>) -> Void
+        token: String,
+        completion: @escaping (Result<FlagEvaluationResult, ApiFailure>) -> Void
     ) {
-        guard let url = URL(string: "\(baseUrl)/public/flag-evaluation") else {
-            completion(.failure(.invalidConfig("Invalid API URL")))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-
         let payload: [String: Any] = [
             "flagKey": flagKey,
             "userId": userId,
             "userAttributes": userAttributes ?? [:]
         ]
-
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        } catch {
-            completion(.failure(.networkError("Failed to encode request")))
-            return
-        }
-
-        perform(request) { data, response, error in
-            if let error = error {
-                completion(.failure(.networkError(error.localizedDescription)))
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                completion(.failure(.networkError("Invalid response")))
-                return
-            }
-
-            guard httpResponse.statusCode == 200, let data = data else {
-                completion(.failure(.apiError(httpResponse.statusCode, "Request failed")))
-                return
-            }
-
-            do {
-                let result = try JSONDecoder().decode(FlagEvaluationResult.self, from: data)
-                completion(.success(result))
-            } catch {
-                completion(.failure(.networkError("Failed to decode response: \(error.localizedDescription)")))
-            }
+        perform("/public/flag-evaluation", body: json(payload), token: token) { result in
+            completion(self.decode(FlagEvaluationResult.self, result))
         }
     }
 
@@ -285,172 +166,43 @@ internal class ApiClient {
         experimentKey: String,
         userId: String,
         userAttributes: [String: Any]?,
-        completion: @escaping (Result<Assignment, RiviumAbTestingError>) -> Void
+        token: String,
+        completion: @escaping (Result<Assignment, ApiFailure>) -> Void
     ) {
-        guard let url = URL(string: "\(baseUrl)/public/assign") else {
-            completion(.failure(.invalidConfig("Invalid API URL")))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-
         let payload: [String: Any] = [
             "experimentKey": experimentKey,
             "userId": userId,
             "userAttributes": userAttributes ?? [:]
         ]
-
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        } catch {
-            completion(.failure(.networkError("Failed to encode request")))
-            return
-        }
-
-        perform(request) { data, response, error in
-            if let error = error {
-                completion(.failure(.networkError(error.localizedDescription)))
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                completion(.failure(.networkError("Invalid response")))
-                return
-            }
-
-            guard httpResponse.statusCode == 200, let data = data else {
-                completion(.failure(.apiError(httpResponse.statusCode, "Request failed")))
-                return
-            }
-
-            do {
-                let apiResponse = try JSONDecoder().decode(ApiResponse<Assignment>.self, from: data)
-                if let assignment = apiResponse.data {
+        perform("/public/assign", body: json(payload), token: token) { result in
+            switch self.decode(ApiResponse<Assignment>.self, result) {
+            case .success(let response):
+                if let assignment = response.data {
                     completion(.success(assignment))
                 } else {
-                    completion(.failure(.experimentNotFound(experimentKey)))
+                    completion(.failure(ApiFailure(status: nil, message: "Experiment not found: \(experimentKey)")))
                 }
-            } catch {
-                completion(.failure(.networkError("Failed to decode response: \(error.localizedDescription)")))
+            case .failure(let failure):
+                completion(.failure(failure))
             }
         }
     }
 
     // MARK: - Events
 
-    /// Track events
+    /// Track events (at most `maxEventsPerRequest` per call)
     func trackEvents(
         _ events: [TrackEvent],
-        explicitToken: String?? = nil,
-        completion: @escaping (Result<Void, RiviumAbTestingError>) -> Void
+        token: String,
+        completion: @escaping (Result<Void, ApiFailure>) -> Void
     ) {
-        guard let url = URL(string: "\(baseUrl)/public/track/batch") else {
-            completion(.failure(.invalidConfig("Invalid API URL")))
+        guard let body = try? JSONEncoder().encode(["events": events]) else {
+            // Would fail the same way every time: nothing to retry.
+            completion(.failure(ApiFailure(status: 400, message: "Failed to encode request")))
             return
         }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-
-        do {
-            let payload = ["events": events]
-            request.httpBody = try JSONEncoder().encode(payload)
-        } catch {
-            completion(.failure(.networkError("Failed to encode request")))
-            return
-        }
-
-        perform(request, explicitToken: explicitToken) { _, response, error in
-            if let error = error {
-                completion(.failure(.networkError(error.localizedDescription)))
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 || httpResponse.statusCode == 201 else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                completion(.failure(.apiError(code, "Request failed")))
-                return
-            }
-
-            completion(.success(()))
-        }
-    }
-
-    // MARK: - Offline Sync
-
-    /// Sync offline events with server
-    func syncOfflineEvents(
-        events: [TrackEvent],
-        deviceId: String,
-        completion: @escaping (Result<SyncResult, RiviumAbTestingError>) -> Void
-    ) {
-        guard let url = URL(string: "\(baseUrl)/public/sync") else {
-            completion(.failure(.invalidConfig("Invalid API URL")))
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-
-        let eventDicts: [[String: Any]] = events.map { event in
-            var dict: [String: Any] = [
-                "experimentId": event.experimentId,
-                "variantId": event.variantId,
-                "userId": event.userId,
-                "eventType": event.eventType.rawValue,
-                "eventName": event.eventName ?? event.eventType.rawValue,
-                "timestamp": event.timestamp
-            ]
-            if let value = event.eventValue {
-                dict["eventValue"] = value
-            }
-            if let props = event.properties {
-                dict["metadata"] = props
-            }
-            return dict
-        }
-
-        let payload: [String: Any] = [
-            "events": eventDicts,
-            "deviceId": deviceId,
-            "sdkVersion": "ios-\(RiviumAbTestingConfig.sdkVersion)"
-        ]
-
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        } catch {
-            completion(.failure(.networkError("Failed to encode request")))
-            return
-        }
-
-        perform(request) { data, response, error in
-            if let error = error {
-                completion(.failure(.networkError(error.localizedDescription)))
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                completion(.failure(.networkError("Invalid response")))
-                return
-            }
-
-            guard httpResponse.statusCode == 200, let data = data else {
-                completion(.failure(.apiError(httpResponse.statusCode, "Request failed")))
-                return
-            }
-
-            do {
-                let syncResponse = try JSONDecoder().decode(SyncResponse.self, from: data)
-                completion(.success(SyncResult(
-                    synced: syncResponse.synced,
-                    failed: syncResponse.failed,
-                    errors: syncResponse.errors
-                )))
-            } catch {
-                completion(.failure(.networkError("Failed to decode response: \(error.localizedDescription)")))
-            }
+        perform("/public/track/batch", body: body, token: token) { result in
+            completion(result.map { _ in () })
         }
     }
 }
@@ -522,19 +274,6 @@ struct SdkConfig: Decodable {
         enableOfflineMode = (try? container.decodeIfPresent(Bool.self, forKey: .enableOfflineMode)) ?? true
         enableDebugMode = (try? container.decodeIfPresent(Bool.self, forKey: .enableDebugMode)) ?? false
     }
-}
-
-private struct SyncResponse: Decodable {
-    let success: Bool
-    let synced: Int
-    let failed: Int
-    let errors: [String]?
-}
-
-struct SyncResult {
-    let synced: Int
-    let failed: Int
-    let errors: [String]?
 }
 
 private struct FlagsResponse: Decodable {

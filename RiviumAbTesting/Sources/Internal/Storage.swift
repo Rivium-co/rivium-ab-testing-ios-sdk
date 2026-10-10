@@ -11,15 +11,30 @@ internal class Storage {
         static let featureFlags = "rivium_ab_testing_feature_flags"
         static let assignments = "rivium_ab_testing_assignments"
         static let userAttributes = "rivium_ab_testing_user_attributes"
+        static let userIdGenerated = "rivium_ab_testing_user_id_generated"
     }
 
-    init() {
-        self.defaults = UserDefaults.standard
+    private let assignmentLock = NSLock()
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
     }
 
     var userId: String? {
         get { defaults.string(forKey: Keys.userId) }
         set { defaults.set(newValue, forKey: Keys.userId) }
+    }
+
+    /// True while `userId` is the random id the SDK made for a user who has
+    /// not signed in. When unknown (an install from an older version) an id
+    /// that looks like the SDK's random ids counts as one.
+    var userIdGenerated: Bool {
+        get {
+            if let known = defaults.object(forKey: Keys.userIdGenerated) as? Bool { return known }
+            guard let userId = userId else { return true }
+            return UUID(uuidString: userId) != nil
+        }
+        set { defaults.set(newValue, forKey: Keys.userIdGenerated) }
     }
 
     var userAttributes: [String: Any]? {
@@ -64,6 +79,8 @@ internal class Storage {
     }
 
     func saveAssignment(_ assignment: Assignment, forExperimentKey key: String) {
+        assignmentLock.lock()
+        defer { assignmentLock.unlock() }
         var assignments = getAssignments()
         assignments[key] = assignment
         guard let data = try? encoder.encode(assignments) else { return }
@@ -82,7 +99,19 @@ internal class Storage {
         return assignments
     }
 
+    /// Forget the assignments that say "not in the experiment", so the service is asked again.
+    func clearOutsideAssignments() {
+        assignmentLock.lock()
+        defer { assignmentLock.unlock() }
+        let assignments = getAssignments()
+        let kept = assignments.filter { $0.value.inExperiment != false }
+        guard kept.count != assignments.count, let data = try? encoder.encode(kept) else { return }
+        defaults.set(data, forKey: Keys.assignments)
+    }
+
     func clearAssignments() {
+        assignmentLock.lock()
+        defer { assignmentLock.unlock() }
         defaults.removeObject(forKey: Keys.assignments)
     }
 
@@ -92,5 +121,6 @@ internal class Storage {
         defaults.removeObject(forKey: Keys.featureFlags)
         defaults.removeObject(forKey: Keys.assignments)
         defaults.removeObject(forKey: Keys.userAttributes)
+        defaults.removeObject(forKey: Keys.userIdGenerated)
     }
 }

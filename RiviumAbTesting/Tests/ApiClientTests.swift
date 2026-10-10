@@ -1,176 +1,198 @@
 import XCTest
 @testable import RiviumAbTesting
 
-/// Answers requests from a script, recording what was sent.
-final class MockURLProtocol: URLProtocol {
-    static var responses: [(Int, String)] = []
-    static var requests: [URLRequest] = []
-    private static let lock = NSLock()
-
-    static func reset(_ responses: [(Int, String)]) {
-        lock.lock(); defer { lock.unlock() }
-        self.responses = responses
-        self.requests = []
-    }
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        Self.lock.lock()
-        Self.requests.append(request)
-        let (status, body) = Self.responses.isEmpty ? (200, "{}") : Self.responses.removeFirst()
-        Self.lock.unlock()
-
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(body.utf8))
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
 final class ApiClientTests: XCTestCase {
-    private func token(_ sub: String, expiresIn: TimeInterval = 3600) -> String {
-        let exp = Int(Date().timeIntervalSince1970 + expiresIn)
-        let payload = Data("{\"sub\":\"\(sub)\",\"exp\":\(exp)}".utf8).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        return "header.\(payload).signature"
+    override func setUp() {
+        super.setUp()
+        FakeService.shared.reset()
     }
 
-    private func client(provider: RiviumTokenProvider? = nil, userToken: String? = nil) -> ApiClient {
+    private func client() -> ApiClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
-        let config = RiviumAbTestingConfig(apiKey: "rv_live_abcdef123456", tokenProvider: provider, userToken: userToken)
-        return ApiClient(config: config, sessionConfiguration: configuration)
+        return ApiClient(config: RiviumAbTestingConfig(apiKey: "rv_live_abcdef123456"), sessionConfiguration: configuration)
     }
 
-    private func fetchFlags(_ api: ApiClient) -> Result<[FeatureFlag], RiviumAbTestingError> {
-        let done = expectation(description: "request")
-        var outcome: Result<[FeatureFlag], RiviumAbTestingError>!
-        api.fetchFeatureFlags { result in
-            outcome = result
+    private func fetch(_ tokens: UserTokens) -> String? {
+        let done = expectation(description: "token")
+        var token: String?
+        tokens.fetch {
+            token = $0
             done.fulfill()
         }
         wait(for: [done], timeout: 5)
-        return outcome
+        return token
     }
 
-    func testSendsApiKeyAndNoTokenWithoutProvider() {
-        MockURLProtocol.reset([(200, "{\"flags\":[]}")])
+    // MARK: - Requests
+
+    func testReadsSendTheApiKeyAndNoUserToken() {
         let api = client()
+        let done = expectation(description: "reads")
+        done.expectedFulfillmentCount = 2
+        api.fetchFeatureFlags { result in
+            if case .failure(let failure) = result { XCTFail("expected success, got \(failure)") }
+            done.fulfill()
+        }
+        api.fetchExperiments { result in
+            XCTAssertEqual((try? result.get())?.count, 2)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
 
-        _ = fetchFlags(api)
-
-        XCTAssertEqual(MockURLProtocol.requests.first?.value(forHTTPHeaderField: "x-api-key"), "rv_live_abcdef123456")
-        XCTAssertNil(MockURLProtocol.requests.first?.value(forHTTPHeaderField: "x-user-token"))
-        XCTAssertFalse(api.usesUserToken)
+        XCTAssertEqual(FakeService.shared.calls.count, 2)
+        XCTAssertTrue(FakeService.shared.calls.allSatisfy { $0.token == nil })
     }
 
-    func testReusesAFreshTokenAndCoalescesProviderCalls() {
-        MockURLProtocol.reset([(200, "{\"flags\":[]}"), (200, "{\"flags\":[]}")])
-        var calls = 0
-        let api = client(provider: { completion in
-            calls += 1
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
-                completion(.success(self.token("alice")))
-            }
-        })
-
-        // Two requests at once must share one provider call.
-        let both = expectation(description: "both")
-        both.expectedFulfillmentCount = 2
-        api.fetchFeatureFlags { _ in both.fulfill() }
-        api.fetchFeatureFlags { _ in both.fulfill() }
-        wait(for: [both], timeout: 5)
-        _ = fetchFlags(api)
-
-        XCTAssertEqual(calls, 1)
-        let tokens = MockURLProtocol.requests.map { $0.value(forHTTPHeaderField: "x-user-token") }
-        XCTAssertEqual(Set(tokens.compactMap { $0 }).count, 1)
-        XCTAssertEqual(tokens.count, 3)
-    }
-
-    func testRefetchesATokenAboutToExpire() {
-        MockURLProtocol.reset([(200, "{\"flags\":[]}"), (200, "{\"flags\":[]}")])
-        var calls = 0
-        let api = client(provider: { completion in
-            calls += 1
-            completion(.success(self.token("alice", expiresIn: 30)))
-        })
-
-        _ = fetchFlags(api)
-        _ = fetchFlags(api)
-
-        XCTAssertEqual(calls, 2)
-    }
-
-    func testTokenExpiredRefetchesAndRetriesOnce() {
-        MockURLProtocol.reset([(401, "{\"code\":\"token_expired\"}"), (200, "{\"flags\":[]}")])
-        var calls = 0
-        let api = client(provider: { completion in
-            calls += 1
-            completion(.success(self.token("alice")))
-        })
-
-        let result = fetchFlags(api)
-
-        if case .failure(let error) = result { XCTFail("expected success, got \(error)") }
-        XCTAssertEqual(MockURLProtocol.requests.count, 2)
-        XCTAssertEqual(calls, 2)
-    }
-
-    func testDoesNotRetryForever() {
-        MockURLProtocol.reset([(401, "{\"code\":\"token_expired\"}"), (401, "{\"code\":\"token_expired\"}"), (401, "{\"code\":\"token_expired\"}")])
-        let api = client(provider: { completion in completion(.success(self.token("alice"))) })
-
-        let result = fetchFlags(api)
-
-        guard case .failure = result else { return XCTFail("expected failure") }
-        XCTAssertEqual(MockURLProtocol.requests.count, 2)
-    }
-
-    func testClearTokenGetsATokenForTheNextUser() {
-        MockURLProtocol.reset([(200, "{\"flags\":[]}"), (200, "{\"flags\":[]}")])
-        var user = "alice"
-        let api = client(provider: { completion in completion(.success(self.token(user))) })
-
-        _ = fetchFlags(api)
-        user = "bob"
-        api.clearToken()
-        _ = fetchFlags(api)
-
-        let tokens = MockURLProtocol.requests.compactMap { $0.value(forHTTPHeaderField: "x-user-token") }
-        XCTAssertEqual(tokens.count, 2)
-        XCTAssertNotEqual(tokens[0], tokens[1])
-    }
-
-    func testExplicitTokenIsSentWithoutAskingTheProvider() {
-        MockURLProtocol.reset([(200, "{}")])
-        var calls = 0
-        let api = client(provider: { completion in calls += 1; completion(.success(self.token("bob"))) })
-        let aliceToken = token("alice")
+    func testAUserCallSendsTheTokenItIsGivenAndAStableEventId() {
+        let api = client()
+        let token = userToken("alice")
         let event = TrackEvent(experimentId: "e", variantId: "v", userId: "alice", eventType: .view)
 
         let done = expectation(description: "track")
-        api.trackEvents([event], explicitToken: .some(aliceToken)) { _ in done.fulfill() }
+        api.trackEvents([event], token: token) { result in
+            if case .failure(let failure) = result { XCTFail("expected success, got \(failure)") }
+            done.fulfill()
+        }
         wait(for: [done], timeout: 5)
 
-        XCTAssertEqual(MockURLProtocol.requests.first?.value(forHTTPHeaderField: "x-user-token"), aliceToken)
-        XCTAssertEqual(calls, 0)
+        let call = FakeService.shared.to("/public/track/batch").first
+        XCTAssertEqual(call?.token, token)
+        XCTAssertEqual(call?.events.first?["clientEventId"] as? String, event.clientEventId)
+        XCTAssertFalse(event.clientEventId.isEmpty)
     }
 
-    func testAFailingProviderDoesNotBreakTheRequest() {
-        MockURLProtocol.reset([(200, "{\"flags\":[]}")])
-        let api = client(provider: { completion in
-            completion(.failure(NSError(domain: "test", code: 1)))
-        })
+    func testErrorCodeAndRetryAfterAreReadFromTheAnswer() {
+        let answers = Counter()
+        FakeService.shared.assign = { _ in
+            answers.next() == 1
+                ? Answer(status: 429, body: "{\"statusCode\":429,\"message\":\"Too many requests\"}", headers: ["Retry-After": "7"])
+                : .json(401, "{\"statusCode\":401,\"code\":\"token_required\",\"message\":\"A signed user token is required\"}")
+        }
+        let api = client()
+        var failures: [ApiFailure] = []
 
-        let result = fetchFlags(api)
+        for _ in 0..<2 {
+            let done = expectation(description: "assign")
+            api.getAssignment(experimentKey: "checkout", userId: "alice", userAttributes: nil, token: "t") { result in
+                if case .failure(let failure) = result { failures.append(failure) }
+                done.fulfill()
+            }
+            wait(for: [done], timeout: 5)
+        }
 
-        if case .failure(let error) = result { XCTFail("expected success, got \(error)") }
-        XCTAssertNil(MockURLProtocol.requests.first?.value(forHTTPHeaderField: "x-user-token"))
+        XCTAssertEqual(failures.count, 2)
+        XCTAssertEqual(failures[0].status, 429)
+        XCTAssertEqual(failures[0].retryAfter, 7)
+        XCTAssertEqual(failures[1].code, "token_required")
+        XCTAssertEqual(failures[1].message, "A signed user token is required")
+    }
+
+    func testNoAnswerIsAFailureWithoutAStatus() {
+        FakeService.shared.reads = { .unreachable }
+        let done = expectation(description: "flags")
+        client().fetchFeatureFlags { result in
+            guard case .failure(let failure) = result else { return XCTFail("expected failure") }
+            XCTAssertNil(failure.status)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+    }
+
+    // MARK: - The user token
+
+    func testTheProviderIsAskedOnceWhileItsTokenIsFresh() {
+        let calls = Counter()
+        let tokens = UserTokens(provider: { completion in
+            calls.next()
+            completion(.success(userToken("alice")))
+        }, userToken: nil)
+
+        let first = fetch(tokens)
+        let second = tokens.held() ?? fetch(tokens)
+
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertEqual(first, second)
+    }
+
+    func testATokenAboutToExpireIsFetchedAgain() {
+        let calls = Counter()
+        let tokens = UserTokens(provider: { completion in
+            calls.next()
+            completion(.success(userToken("alice", expiresIn: 30)))
+        }, userToken: nil)
+
+        _ = fetch(tokens)
+        XCTAssertNil(tokens.held())
+        _ = fetch(tokens)
+
+        XCTAssertEqual(calls.value, 2)
+    }
+
+    func testCallersAtTheSameMomentShareOneProviderCall() {
+        let calls = Counter()
+        let tokens = UserTokens(provider: { completion in
+            calls.next()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+                completion(.success(userToken("alice")))
+            }
+        }, userToken: nil)
+
+        let all = expectation(description: "all")
+        all.expectedFulfillmentCount = 4
+        for _ in 0..<4 {
+            tokens.fetch { token in
+                XCTAssertNotNil(token)
+                all.fulfill()
+            }
+        }
+        wait(for: [all], timeout: 5)
+
+        XCTAssertEqual(calls.value, 1)
+    }
+
+    func testAProviderThatFailsMeansNoToken() {
+        let failing = UserTokens(provider: { $0(.failure(NSError(domain: "test", code: 1))) }, userToken: nil)
+        let empty = UserTokens(provider: { $0(.success("")) }, userToken: nil)
+        let none = UserTokens(provider: nil, userToken: nil)
+
+        XCTAssertNil(fetch(failing))
+        XCTAssertNil(fetch(empty))
+        XCTAssertNil(fetch(none))
+    }
+
+    func testAProviderThatNeverAnswersTimesOutAndCanBeAskedAgain() {
+        let calls = Counter()
+        let tokens = UserTokens(provider: { completion in
+            if calls.next() > 1 { completion(.success(userToken("alice"))) }
+        }, userToken: nil, providerTimeout: 0.2)
+
+        let started = Date()
+        XCTAssertNil(fetch(tokens))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+
+        XCTAssertNotNil(fetch(tokens))
+    }
+
+    func testATokenTheAppSetWinsAndNilTakesEveryTokenAway() {
+        let tokens = UserTokens(provider: { $0(.success(userToken("alice"))) }, userToken: nil)
+        _ = fetch(tokens)
+
+        let pushed = userToken("alice", salt: "2")
+        tokens.set(pushed)
+        XCTAssertEqual(tokens.held(), pushed)
+
+        tokens.set(nil)
+        XCTAssertNil(tokens.peek())
+    }
+
+    func testTokensForAnotherUserAreDroppedOnAUserChange() {
+        let tokens = UserTokens(provider: nil, userToken: userToken("alice"))
+
+        tokens.dropTokensNotFor("alice")
+        XCTAssertNotNil(tokens.held())
+
+        tokens.dropTokensNotFor("bob")
+        XCTAssertNil(tokens.held())
     }
 }
