@@ -237,9 +237,10 @@ struct InitResponse: Decodable {
     }
 }
 
+/// What the console says. A value that is missing is nil: the SDK keeps what it uses.
 struct SdkConfig: Decodable {
-    let cacheTtlSeconds: Int
-    let syncIntervalSeconds: Int
+    let cacheTtlSeconds: Int?
+    let syncIntervalSeconds: Int?
     let maxOfflineEvents: Int
     let maxBatchSize: Int
     let enableOfflineMode: Bool
@@ -250,8 +251,8 @@ struct SdkConfig: Decodable {
     }
 
     init(
-        cacheTtlSeconds: Int = 300,
-        syncIntervalSeconds: Int = 30,
+        cacheTtlSeconds: Int? = nil,
+        syncIntervalSeconds: Int? = nil,
         maxOfflineEvents: Int = 1000,
         maxBatchSize: Int = 100,
         enableOfflineMode: Bool = true,
@@ -267,8 +268,8 @@ struct SdkConfig: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        cacheTtlSeconds = (try? container.decodeIfPresent(Int.self, forKey: .cacheTtlSeconds)) ?? 300
-        syncIntervalSeconds = (try? container.decodeIfPresent(Int.self, forKey: .syncIntervalSeconds)) ?? 30
+        cacheTtlSeconds = (try? container.decodeIfPresent(Int.self, forKey: .cacheTtlSeconds)) ?? nil
+        syncIntervalSeconds = (try? container.decodeIfPresent(Int.self, forKey: .syncIntervalSeconds)) ?? nil
         maxOfflineEvents = (try? container.decodeIfPresent(Int.self, forKey: .maxOfflineEvents)) ?? 1000
         maxBatchSize = (try? container.decodeIfPresent(Int.self, forKey: .maxBatchSize)) ?? 100
         enableOfflineMode = (try? container.decodeIfPresent(Bool.self, forKey: .enableOfflineMode)) ?? true

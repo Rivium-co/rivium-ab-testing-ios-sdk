@@ -26,8 +26,18 @@ public struct RiviumAbTestingConfig {
     /// Enable debug logging (development only; keys, tokens and request bodies are not logged)
     public let debug: Bool
 
-    /// Interval for flushing events (in seconds)
+    /// Interval for flushing events (in seconds).
+    ///
+    /// Leave it out to follow the send interval set in the Rivium console
+    /// (30 seconds until the console's value is known). A value you pass is
+    /// your own choice and is always used.
     public let flushInterval: TimeInterval
+
+    /// True when the app passed its own `flushInterval`.
+    internal let hasOwnFlushInterval: Bool
+
+    /// The `flushInterval` used until the console's value is known.
+    internal static let defaultFlushInterval: TimeInterval = 30.0
 
     /// Maximum events to queue before forcing flush
     public let maxQueueSize: Int
@@ -48,12 +58,12 @@ public struct RiviumAbTestingConfig {
     internal static let apiUrl = "https://abtest.rivium.co"
 
     /// SDK version (updated by publish script)
-    internal static let sdkVersion = "0.2.2"
+    internal static let sdkVersion = "0.2.3"
 
     public init(
         apiKey: String,
         debug: Bool = false,
-        flushInterval: TimeInterval = 30.0,
+        flushInterval: TimeInterval? = nil,
         maxQueueSize: Int = 100,
         autoTrack: Bool = true,
         tokenProvider: RiviumTokenProvider? = nil,
@@ -61,7 +71,8 @@ public struct RiviumAbTestingConfig {
     ) {
         self.apiKey = apiKey
         self.debug = debug
-        self.flushInterval = flushInterval
+        self.flushInterval = flushInterval ?? RiviumAbTestingConfig.defaultFlushInterval
+        self.hasOwnFlushInterval = flushInterval != nil
         self.maxQueueSize = maxQueueSize
         self.autoTrack = autoTrack
         self.tokenProvider = tokenProvider

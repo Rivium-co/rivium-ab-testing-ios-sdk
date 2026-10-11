@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.3
+
+- Follows the send interval and the list cache set in the Rivium console: events are sent as often as the console says, and the experiment list is asked for again once it is older than the console allows. Changes apply while the app runs.
+- A `flushInterval` you pass is your own choice and still wins over the console's value.
+- Sends each event's own time.
+- Events of a user the service keeps out of an experiment are sent like any other; the service decides what counts.
+
 ## 0.2.2
 
 - Waits for a user token when the app starts before sign-in: `getVariant` returns your default and events are kept until a token arrives. New `isAwaitingUserToken`, `onAwaitingUserToken`, `setUserToken(_:)`, `refreshUserToken()` and `clearUserId()`.

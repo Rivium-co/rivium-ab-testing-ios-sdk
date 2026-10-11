@@ -19,7 +19,8 @@ internal class EventQueue {
     /// Sends one chunk as `userId`. Nil: there is no user token to send it under, so wait.
     typealias Send = (_ userId: String, _ events: [TrackEvent], _ completion: @escaping (Result<Void, ApiFailure>?) -> Void) -> Void
 
-    private let flushInterval: TimeInterval
+    /// The current send interval; guarded by `lock`.
+    private var flushInterval: TimeInterval
     /// The signed-in user; only their events may be sent.
     private let currentUserId: () -> String?
     private let send: Send
@@ -186,6 +187,13 @@ internal class EventQueue {
             self.lock.unlock()
             if goOn { self.sendNextChunk() }
         }
+    }
+
+    /// The send interval changed while the app runs.
+    func setFlushInterval(_ seconds: TimeInterval) {
+        lock.lock()
+        flushInterval = seconds
+        lock.unlock()
     }
 
     /// The network is back: a pause that was only about the network ends now.

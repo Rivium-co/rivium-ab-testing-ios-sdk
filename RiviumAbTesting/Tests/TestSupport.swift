@@ -68,11 +68,22 @@ final class FakeService {
     private var readsHandler: () -> Answer? = { nil }
     private var assignHandler: (Call) -> Answer = { _ in .assigned() }
     private var trackHandler: (Call) -> Answer = { .tracked($0.events.count) }
+    private var configJSON = "{}"
 
-    static let initBody = "{\"experiments\":["
-        + "{\"id\":\"exp-1\",\"key\":\"checkout\",\"name\":\"Checkout\",\"trafficAllocation\":100,\"variants\":[]},"
-        + "{\"id\":\"exp-2\",\"key\":\"pricing\",\"name\":\"Pricing\",\"trafficAllocation\":100,\"variants\":[]}"
-        + "],\"config\":{}}"
+    static let initBody = initBody(config: "{}")
+
+    static func initBody(config: String) -> String {
+        return "{\"experiments\":["
+            + "{\"id\":\"exp-1\",\"key\":\"checkout\",\"name\":\"Checkout\",\"trafficAllocation\":100,\"variants\":[]},"
+            + "{\"id\":\"exp-2\",\"key\":\"pricing\",\"name\":\"Pricing\",\"trafficAllocation\":100,\"variants\":[]}"
+            + "],\"config\":\(config)}"
+    }
+
+    /// The `config` object of `/public/init`, as JSON.
+    var config: String {
+        get { lock.lock(); defer { lock.unlock() }; return configJSON }
+        set { lock.lock(); configJSON = newValue; lock.unlock() }
+    }
     static let flagsBody = "{\"flags\":[{\"id\":\"f1\",\"key\":\"new-ui\",\"name\":\"New UI\",\"enabled\":true,\"rolloutPercentage\":100}]}"
 
     func reset() {
@@ -81,6 +92,7 @@ final class FakeService {
         readsHandler = { nil }
         assignHandler = { _ in .assigned() }
         trackHandler = { .tracked($0.events.count) }
+        configJSON = "{}"
         lock.unlock()
     }
 
@@ -124,10 +136,11 @@ final class FakeService {
         let reads = readsHandler
         let assign = assignHandler
         let track = trackHandler
+        let config = configJSON
         lock.unlock()
 
         switch call.path {
-        case "/public/init": return reads() ?? .json(200, Self.initBody)
+        case "/public/init": return reads() ?? .json(200, Self.initBody(config: config))
         case "/public/flags": return reads() ?? .json(200, Self.flagsBody)
         case "/public/assign": return assign(call)
         case "/public/track/batch": return track(call)

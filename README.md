@@ -30,14 +30,14 @@ Or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Rivium-co/rivium-ab-testing-ios-sdk.git", from: "0.2.2")
+    .package(url: "https://github.com/Rivium-co/rivium-ab-testing-ios-sdk.git", from: "0.2.3")
 ]
 ```
 
 ### CocoaPods
 
 ```ruby
-pod 'RiviumAbTestingSDK', '~> 0.2.2'
+pod 'RiviumAbTestingSDK', '~> 0.2.3'
 ```
 
 Then run `pod install`.
@@ -334,7 +334,7 @@ let config = RiviumAbTestingConfig(
     apiKey: "rv_live_your_api_key",
     tokenProvider: fetchRiviumToken, // user token minted by your server
     debug: false,               // log to the console (development only; no keys, tokens or bodies)
-    flushInterval: 10.0,        // Auto-flush interval in seconds (default: 30)
+    flushInterval: 10.0,        // Auto-flush interval in seconds. Leave it out to follow the send interval set in the Rivium console (30 until it is known)
     maxQueueSize: 50            // Max events before auto-flush (default: 100)
 )
 ```

@@ -34,6 +34,7 @@ public final class RiviumAbTesting {
         var legacyQueueFileURL: URL? = EventQueue.legacyFileURL
         var observesNetwork = true
         var tokenProviderTimeout: TimeInterval = 15
+        var now: () -> TimeInterval = { Date().timeIntervalSince1970 }
     }
 
     private let environment: Environment
@@ -70,6 +71,16 @@ public final class RiviumAbTesting {
     private var rejectedToken: String?
     private var adoptedToken: String?
 
+    // What the console says about sending and caching; guarded by stateLock.
+    /// How often events are sent: the app's own `flushInterval` when it
+    /// passed one, otherwise the console's send interval once it is known.
+    private var flushInterval: TimeInterval = RiviumAbTestingConfig.defaultFlushInterval
+    /// How long the experiment list is used before the service is asked again.
+    private var listCache: TimeInterval = RiviumAbTesting.defaultListCache
+    private var listFetchedAt: TimeInterval = 0
+    private var listRetryAt: TimeInterval = 0
+    private var isRefreshingList = false
+
     /// Background work starts here, so no public call waits on the network
     /// or on the app's token provider.
     private let work = DispatchQueue(label: "co.rivium.abtesting.work")
@@ -77,6 +88,14 @@ public final class RiviumAbTesting {
     /// After a failed assignment the same experiment is not asked about again for this long.
     private static let assignRetryDelay: TimeInterval = 10
     private static let defaultRateLimitPause: TimeInterval = 60
+
+    private static let defaultListCache: TimeInterval = 300
+    /// After a list refresh that failed, the next one waits this long.
+    private static let listRetryDelay: TimeInterval = 60
+    // Whatever the console says, events are never sent more often than every
+    // 10 seconds and the list is never asked for more than once a minute.
+    private static let sendIntervalBounds: ClosedRange<Int> = 10...3600
+    private static let listCacheBounds: ClosedRange<Int> = 60...86_400
 
     internal init(environment: Environment = Environment()) {
         self.environment = environment
@@ -117,6 +136,7 @@ public final class RiviumAbTesting {
         self.config = config
         self.storage = storage
         self.apiClient = apiClient
+        self.flushInterval = config.flushInterval
         self.tokens = UserTokens(
             provider: config.tokenProvider,
             userToken: config.userToken,
@@ -215,6 +235,7 @@ public final class RiviumAbTesting {
     }
 
     private func startFlushTimer(interval: TimeInterval) {
+        flushTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: work)
         let seconds = max(interval, 1)
         timer.schedule(deadline: .now() + seconds, repeating: seconds)
@@ -225,6 +246,54 @@ public final class RiviumAbTesting {
         }
         timer.resume()
         flushTimer = timer
+    }
+
+    /// Takes over what the console says: how long the experiment list is
+    /// kept and, unless the app passed its own interval, how often events
+    /// are sent. Values out of bounds are brought inside them; a missing one
+    /// changes nothing.
+    private func apply(_ sdkConfig: SdkConfig) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let config = config else { return }
+        if let seconds = sdkConfig.cacheTtlSeconds, seconds > 0 {
+            let bounds = Self.listCacheBounds
+            listCache = TimeInterval(min(max(seconds, bounds.lowerBound), bounds.upperBound))
+        }
+        guard !config.hasOwnFlushInterval, let seconds = sdkConfig.syncIntervalSeconds, seconds > 0 else { return }
+        let bounds = Self.sendIntervalBounds
+        let interval = TimeInterval(min(max(seconds, bounds.lowerBound), bounds.upperBound))
+        guard interval != flushInterval else { return }
+        flushInterval = interval
+        eventQueue?.setFlushInterval(interval)
+        Log.debug("Send interval is now \(Int(interval))s")
+        // A timer that was stopped stays stopped.
+        if flushTimer != nil { startFlushTimer(interval: interval) }
+    }
+
+    /// The experiment list is older than the console allows: ask again in
+    /// the background. The caller is never kept waiting and goes on with the
+    /// list it has. Only one refresh runs at a time.
+    private func refreshListIfStale() {
+        stateLock.lock()
+        let now = environment.now()
+        let age = now - listFetchedAt
+        guard isInitialized, !isLoading, !isRefreshingList, now >= listRetryAt, age < 0 || age >= listCache else {
+            stateLock.unlock()
+            return
+        }
+        isRefreshingList = true
+        stateLock.unlock()
+
+        work.async { [weak self] in
+            guard let self = self else { return }
+            self.loadExperiments(quietly: true) { ok in
+                self.stateLock.lock()
+                self.isRefreshingList = false
+                self.listRetryAt = ok ? 0 : self.environment.now() + Self.listRetryDelay
+                self.stateLock.unlock()
+            }
+        }
     }
 
     private func networkAvailable() {
@@ -630,6 +699,7 @@ public final class RiviumAbTesting {
             notInitialized("getVariant")
             return defaultVariant
         }
+        refreshListIfStale()
 
         // Check cached assignment
         if let assignment = storage.getAssignment(forExperimentKey: experimentKey) {
@@ -660,6 +730,7 @@ public final class RiviumAbTesting {
         defaultVariant: String = "control",
         completion: @escaping (String) -> Void
     ) {
+        refreshListIfStale()
         work.async { [weak self] in
             let finish: (String) -> Void = { variant in
                 DispatchQueue.main.async { completion(variant) }
@@ -754,12 +825,13 @@ public final class RiviumAbTesting {
                 self.assignRetryAt[experimentKey] = nil
                 self.stateLock.unlock()
 
-                // Events recorded before the answer can go now - unless the
-                // user is only shown the control and does not take part.
+                // Events recorded before the answer can go now. That holds
+                // for a user who is only shown the control too: the service
+                // decides what an event counts for.
                 self.eventQueue?.resolve(
                     userId: userId,
                     experimentId: assignment.experimentId,
-                    variantId: assignment.inExperiment == false ? nil : assignment.variantId
+                    variantId: assignment.variantId
                 )
                 let configDict = assignment.config?.mapValues { $0.value }
                 self.notifyDelegates {
@@ -928,22 +1000,34 @@ public final class RiviumAbTesting {
         loadExperiments { _ in completion?() }
     }
 
-    private func loadExperiments(completion: @escaping (Bool) -> Void) {
+    /// One request brings the experiment list and what the console says
+    /// about sending and caching. `quietly`: a failure is not reported (a
+    /// refresh the app did not ask for).
+    private func loadExperiments(quietly: Bool = false, completion: @escaping (Bool) -> Void) {
         guard let apiClient = apiClient else { return completion(false) }
-        apiClient.fetchExperiments { [weak self] result in
+        apiClient.initSdk { [weak self] result in
             switch result {
-            case .success(let fetchedExperiments):
+            case .success(let response):
+                let fetchedExperiments = response.experiments
                 self?.experimentLock.lock()
                 self?.experiments = fetchedExperiments
                 self?.experimentLock.unlock()
 
                 self?.storage?.saveExperiments(fetchedExperiments)
+                if let self = self {
+                    self.stateLock.lock()
+                    self.listFetchedAt = self.environment.now()
+                    self.stateLock.unlock()
+                    if let sdkConfig = response.config { self.apply(sdkConfig) }
+                }
                 self?.notifyDelegates { $0.riviumAbTesting(didRefreshExperiments: fetchedExperiments) }
                 completion(true)
 
             case .failure(let failure):
-                let error = failure.publicError
-                self?.notifyDelegates { $0.riviumAbTesting(didReceiveError: error) }
+                if !quietly {
+                    let error = failure.publicError
+                    self?.notifyDelegates { $0.riviumAbTesting(didReceiveError: error) }
+                }
                 completion(false)
             }
         }
@@ -1164,6 +1248,11 @@ public final class RiviumAbTesting {
         rateLimitedUntil = 0
         rejectedToken = nil
         adoptedToken = nil
+        flushInterval = RiviumAbTestingConfig.defaultFlushInterval
+        listCache = Self.defaultListCache
+        listFetchedAt = 0
+        listRetryAt = 0
+        isRefreshingList = false
         stateLock.unlock()
 
         experimentLock.lock()
@@ -1187,14 +1276,13 @@ public final class RiviumAbTesting {
             return notInitialized("track")
         }
         guard let userId = storage.userId else { return }
+        refreshListIfStale()
 
         let experimentId: String
         let variantId: String
         if let assignment = storage.getAssignment(forExperimentKey: experimentKey) {
-            if assignment.inExperiment == false {
-                Log.debug("User is not in experiment \(experimentKey) - event not recorded")
-                return
-            }
+            // A user who is only shown the control (inExperiment == false)
+            // is tracked like anyone else: the service decides what counts.
             experimentId = assignment.experimentId
             variantId = assignment.variantId
         } else {
@@ -1252,5 +1340,17 @@ public final class RiviumAbTesting {
 
     internal func waitForDisk() {
         eventQueue?.waitForDisk()
+    }
+
+    internal var currentFlushInterval: TimeInterval {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return flushInterval
+    }
+
+    internal var currentListCache: TimeInterval {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return listCache
     }
 }

@@ -433,17 +433,53 @@ final class SDKTests: XCTestCase {
         XCTAssertTrue(recorder.assigned.isEmpty)
     }
 
-    func testAUserOutsideTheExperimentGetsTheControlAndNoEvents() {
+    func testAUserOutsideTheExperimentGetsTheControlAndTheirEventsAreSentOnce() {
         service.assign = { _ in .assigned(variantKey: "control", inExperiment: false) }
+        // The service takes the request and counts such an event as not stored.
+        service.track = { call in
+            .json(200, "{\"success\":true,\"tracked\":0,\"eventIds\":[],\"duplicates\":0,\"ignored\":\(call.events.count)}")
+        }
         let sdk = start(userToken: userToken("alice"))
 
         XCTAssertEqual(variant(sdk, default: "fallback"), "control")
         sdk.trackClick(experimentKey: "checkout")
         sdk.flush()
+        eventually { self.service.to("/public/track/batch").count == 1 }
+        settle()
+        sdk.flush()
         settle()
 
+        XCTAssertEqual(service.trackedEvents.count, 1)
+        XCTAssertEqual(service.trackedEvents.first?["experimentId"] as? String, "exp-1")
+        XCTAssertEqual(service.trackedEvents.first?["userId"] as? String, "alice")
+        // Not kept, not sent again, and not an error.
         XCTAssertEqual(sdk.pendingEventCount, 0)
-        XCTAssertTrue(service.to("/public/track/batch").isEmpty)
+        XCTAssertEqual(service.to("/public/track/batch").count, 1)
+        XCTAssertTrue(recorder.errors.isEmpty)
+    }
+
+    func testEventsRecordedBeforeTheServiceSaidTheUserIsOutsideAreSentToo() {
+        let token = Box<String?>(nil)
+        service.assign = { _ in .assigned(variantKey: "control", inExperiment: false) }
+        let sdk = start(provider: { completion in
+            if let value = token.value { completion(.success(value)) } else { completion(.failure(URLError(.userAuthenticationRequired))) }
+        })
+        sdk.setUserId("alice")
+        eventually { sdk.isAwaitingUserToken }
+
+        XCTAssertEqual(sdk.getVariant(experimentKey: "checkout", defaultVariant: "fallback"), "fallback")
+        sdk.trackClick(experimentKey: "checkout")
+        XCTAssertEqual(sdk.pendingEventCount, 1)
+        XCTAssertTrue(service.userCalls.isEmpty)
+
+        token.value = userToken("alice")
+        sdk.refreshUserToken()
+        eventually { !self.service.to("/public/track/batch").isEmpty }
+
+        XCTAssertEqual(service.trackedEvents.count, 1)
+        XCTAssertEqual(service.trackedEvents.first?["userId"] as? String, "alice")
+        XCTAssertFalse((service.trackedEvents.first?["variantId"] as? String ?? "").isEmpty)
+        eventually { sdk.pendingEventCount == 0 }
         XCTAssertTrue(recorder.errors.isEmpty)
     }
 
